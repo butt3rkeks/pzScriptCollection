@@ -675,6 +675,23 @@ def patch_world_dictionary(filepath, dry_run=False):
 # Main
 # ---------------------------------------------------------------------------
 
+def _read_world_version(save_dir):
+    """Read world version from map_ver.bin (SP) or map_t.bin (MP dedicated server).
+    Returns version int or None if neither file exists."""
+    ver_file = save_dir / "map_ver.bin"
+    if ver_file.exists():
+        data = ver_file.read_bytes()
+        if len(data) >= 4:
+            return struct.unpack_from(">i", data, 0)[0]
+    # MP dedicated servers write version to map_t.bin: "GMTM" + int version
+    t_file = save_dir / "map_t.bin"
+    if t_file.exists():
+        data = t_file.read_bytes()
+        if len(data) >= 8 and data[:4] == b"GMTM":
+            return struct.unpack_from(">i", data, 4)[0]
+    return None
+
+
 def main():
     dry_run = "--dry-run" in sys.argv
     force = "--force" in sys.argv
@@ -686,11 +703,11 @@ def main():
     log.info(f"PZ Save Converter: v{OLD_VERSION} -> v{NEW_VERSION}{mode}")
     log.info(f"Save directory: {save_dir}")
 
-    if not (save_dir / "map_ver.bin").exists():
-        log.error("map_ver.bin not found. Are you in the save directory?")
+    current = _read_world_version(save_dir)
+    if current is None:
+        log.error("Cannot detect world version. No map_ver.bin or map_t.bin found. "
+                  "Are you in the save directory?")
         sys.exit(1)
-
-    current = struct.unpack_from(">i", (save_dir / "map_ver.bin").read_bytes(), 0)[0]
     if current == NEW_VERSION:
         log.info(f"Already at v{NEW_VERSION}. Nothing to do.")
         return
@@ -817,8 +834,8 @@ def main():
     log.info(f"  Chunks:  {stats['chunks']}")
     log.info(f"  Animals: {stats['animals']}")
     log.info(f"  DB rows: {stats['db_rows']}")
-    final = struct.unpack_from(">i", (save_dir / "map_ver.bin").read_bytes(), 0)[0]
-    log.info(f"  map_ver.bin: v{final}" + (" OK" if final == NEW_VERSION else " FAILED"))
+    final = _read_world_version(save_dir)
+    log.info(f"  World version: v{final}" + (" OK" if final == NEW_VERSION else " FAILED"))
 
 
 def _dry_run(save_dir, stats):
