@@ -1,0 +1,288 @@
+================================================================================
+  revive_player.py — Project Zomboid Player Revival & Editor Tool
+================================================================================
+
+PURPOSE
+-------
+Parses the binary player data blob stored in the `networkPlayers` SQLite
+database (server-side), allowing you to:
+
+  - Revive a dead player by patching health, infection, and death flags
+  - Run read-only diagnostics on a player's state (alive/dead, HP, infections)
+  - Edit any player field via a JSON round-trip workflow
+
+The tool fully deserializes the binary blob, records the byte offset of every
+field, and writes patches by offset — so only the changed bytes are modified
+and the rest of the blob remains untouched.
+
+
+REQUIREMENTS
+------------
+- Python 3.10+ (uses dataclasses, typing, OrderedDict, pathlib)
+- No third-party packages required (stdlib only)
+- The `pz_blob/` package must be in the same directory as revive_player.py
+
+
+INPUT FILES
+-----------
+  players.db (or networkPlayers SQLite DB)
+      Server-side database from the PZ save folder. Contains one row per
+      player in the `networkPlayers` table. The `data` column holds the
+      binary player blob. Also stores `isDead`, `username`, `steamid`,
+      `worldversion`, and position.
+
+      NOTE: This is the SERVER's database, not the client's.
+
+  Alternatively, a standalone .bin file containing a raw player data blob
+  (extracted manually or by other tools).
+
+
+USAGE
+-----
+All commands support -v (verbose hex-offset logging) and use big-endian
+binary parsing matching Java's ByteBuffer.
+
+  VERIFY (read-only diagnostic):
+    python revive_player.py verify db players.db "PlayerName" -v
+    python revive_player.py verify blob player_data.bin -v
+
+    Shows: overall HP estimate, per-body-part health, infection state,
+    death-relevant stats, death flags, and a verdict listing all identified
+    death causes. Makes no changes.
+
+  REVIVE (patch dead player):
+    python revive_player.py db players.db "PlayerName"
+    python revive_player.py blob player_data.bin --out patched.bin
+
+    Patches all health/infection/death fields to revive the player.
+    For DB mode, also sets isDead=0 in the database.
+
+  DRY RUN (see changes without writing):
+    python revive_player.py db players.db "PlayerName" --dry-run -v
+
+    Parses and shows every field that would be changed, with hex offsets
+    and old/new values, but writes nothing.
+
+  EDIT (interactive JSON editor):
+    python revive_player.py edit db players.db "PlayerName"
+    python revive_player.py edit blob player_data.bin
+
+    1. Exports all parsed fields to a JSON file (PlayerName_edit.json)
+    2. Waits for you to edit the file externally
+    3. Press Enter when done — applies only the changed values back
+
+    The JSON includes hex offsets, field types, and an "editable" flag.
+    Only fields marked editable:true are safe to modify.
+
+OPTIONS
+-------
+  -v, --verbose          Hex-offset parse logging for every field read
+  --dry-run              Show changes without writing (revive modes only)
+  --player-index N       Player index 0-3 for split-screen (default: 0)
+  --world-version N      Override world version (auto-detected from DB;
+                         defaults to 241 for blob mode)
+  --out PATH             Output file path (blob mode; default: input.patched.bin)
+  --json-path PATH       Custom JSON file path (edit mode)
+
+  The player identifier can be either a username or Steam ID.
+
+
+WHAT REVIVE PATCHES
+-------------------
+The revival applies these changes (in order):
+
+  1. All 17 body parts:
+     - health       -> 100.0
+     - bitten       -> 0
+     - scratched    -> 0
+     - cut          -> 0
+     - bleeding     -> 0
+     - deepWounded  -> 0
+     - infected     -> 0
+     - fakeInfected -> 0
+
+  2. BodyDamage:
+     - infectionTime              -> -1.0  (no-infection sentinel)
+     - infectionMortalityDuration -> -1.0
+
+  3. Stats:
+     - ZombieFever      -> 0.0
+     - ZombieInfection   -> 0.0
+     - Pain              -> 0.0
+     - Sickness          -> 0.0
+     - Poison            -> 0.0
+     - FoodSickness      -> 0.0
+     - Endurance         -> 1.0  (if below 1.0)
+
+  4. Death flag:
+     - deathDragDown     -> 0
+
+  For DB mode, additionally: isDead -> 0 in the database row.
+
+  NOTE: The player's inventory remains on their corpse zombie in the world.
+  They will respawn with default items. The corpse must be looted in-game.
+
+
+SAFETY
+------
+  - DB mode creates a .db.bak backup before writing (first run only).
+  - Dry-run mode allows full inspection without any writes.
+  - The JSON editor only applies fields marked editable:true.
+  - Guard bytes (_bandaged, _infectedWound, _hasSplint) are marked read-only
+    because toggling them changes the binary layout of subsequent fields,
+    which would corrupt the blob.
+  - String values and array lengths cannot be edited (changing their byte
+    length would shift all subsequent offsets).
+
+
+BINARY FORMAT — PLAYER DATA BLOB
+---------------------------------
+All data is big-endian (Java ByteBuffer). The blob is the serialization of
+IsoPlayer, read in this exact order (must match Java's load sequence):
+
+  Section                 Key fields
+  ----------------------  -------------------------------------------------
+  IsoPlayerHeader         _serialise (byte), _objectID (byte)
+  IsoMovingObject         offsets (2x float), position (3x float),
+                          direction (int), optional KahluaTable (modData)
+  SurvivorDesc            forename, surname, profession, isFemale, extras,
+                          XP boost map, voice fields (>= 208)
+  HumanVisual             bitmask-driven color/model fields, clothing visuals
+  Inventory               type string, CompressIdenticalItems, capacity
+  Sleep                   asleep (byte), forceWakeUpTime (float)
+  Stats                   24 floats in fixed order (see STAT_NAMES)
+  BodyParts (x17)         per part: status bytes, health float, bandage/
+                          wound/timing fields, conditional splint/bandage
+  BodyDamage              cold fields, infectionTime, infectionMortalityDuration
+  Thermoregulator         body temp model, thermal node array (conditional)
+  XP                      traits list, totalXp, level, perk levels, xpMap,
+                          XP multipliers
+  HandItems               leftHandItem (int), rightHandItem (int)
+  OnFire                  1 byte
+  Effects                 8 floats (depression, beta blockers, pain, sleeping)
+  Books                   known books + reduceInfectionPower float
+  Recipes                 known recipe list
+  Timers                  lastHourSleeped, smoke/beard/hair timings
+  CheatFlags              8-10 bytes including deathDragDown
+  Literature              known literature
+  PrintMedia              (>= 222) print media list
+  AnimalMisc              lastAnimalPet (long)
+  PlayerCheats            (>= 231) skip block
+  IsoPlayer Data          hoursSurvived, zombieKills, worn items,
+                          hand indices, survivorKills
+  Nutrition               calories, proteins, lipids, carbohydrates, weight
+  PlayerMeta              chat/tag/color/display settings
+  Vehicle                 conditional: vehicleX/Y, seat, running
+  Mechanics               known vehicle IDs
+  Fitness                 5 internal maps (read-only)
+  AlreadyReadBooks        short count + short list
+  KnownMedia              short count + string list
+  Voice                   (>= 203) 1 byte
+  CraftHistory            (>= 228) crafting log entries
+
+PZ strings:      short numBytes + UTF-8 payload
+KahluaTableImpl: int count + count x (byte keyType + key, byte valType + value)
+                 Types: 0=STRING, 1=DOUBLE, 2=TABLE(recursive), 3=BOOLEAN
+
+Body part field order is critical — three guard bytes (_bandaged,
+_infectedWound, _hasSplint) control whether their associated float fields
+are present in the stream. This is why they are read-only in the editor.
+
+
+STAT NAMES (index order)
+------------------------
+  0  Anger              12 Pain
+  1  Boredom            13 Panic
+  2  Discomfort         14 Poison
+  3  Endurance          15 Sanity
+  4  Fatigue            16 Sickness
+  5  Fitness            17 Stress
+  6  FoodSickness       18 Temperature
+  7  Hunger             19 Thirst
+  8  Idleness           20 Unhappiness
+  9  Intoxication       21 Wetness
+  10 Morale             22 ZombieFever
+  11 NicotineWithdrawal 23 ZombieInfection
+
+
+BODY PARTS (index order)
+------------------------
+   0 Hand_L        9  Neck
+   1 Hand_R       10  Groin
+   2 ForeArm_L    11  UpperLeg_L
+   3 ForeArm_R    12  UpperLeg_R
+   4 UpperArm_L   13  LowerLeg_L
+   5 UpperArm_R   14  LowerLeg_R
+   6 Torso_Upper  15  Foot_L
+   7 Torso_Lower  16  Foot_R
+   8 Head
+
+Damage modifiers (weight for overall HP calculation):
+  Head=0.6, Neck=0.7 (most lethal); Torso_Lower=0.4, Torso_Upper=0.35;
+  Hands=0.1 (least impact).
+
+
+MODULE STRUCTURE
+----------------
+  revive_player.py        CLI entry point and argument parsing
+  pz_blob/
+    __init__.py           Public API re-exports
+    reader.py             BlobReader: big-endian binary read/write primitives
+    constants.py          Stat names, body parts, damage modifiers
+    log.py                Verbose logging, field-entry factory functions
+    kahlua.py             KahluaTableImpl (Lua modData) parser
+    parsers.py            Per-section binary parsers (one function each)
+    blob.py               Orchestrator: drives full blob parse, PatchInfo
+    patch.py              Revival logic and diagnostic reporter
+    json_edit.py          JSON export/import for interactive editing
+    db.py                 SQLite access (networkPlayers table)
+    commands.py           CLI command handlers (revive, verify, edit)
+
+
+SOURCE REFERENCES
+-----------------
+Binary format derived from decompiled source (Vineflower from projectzomboid.jar):
+
+  zombie.characters.IsoPlayer          — load()/save()
+  zombie.characters.IsoGameCharacter   — load()/save()
+  zombie.characters.SurvivorDesc       — load()/save()
+  zombie.characters.BodyDamage         — load()/save()
+  zombie.characters.BodyPartType       — damage modifiers
+  zombie.characters.CharacterTimedActions
+  zombie.iso.IsoMovingObject           — load()/save()
+  zombie.inventory.ItemContainer       — load()/save()
+  zombie.inventory.CompressIdenticalItems
+  zombie.core.skinnedmodel.visual.HumanVisual
+  se.krka.kahlua.j2se.KahluaTableImpl  — save()/load() (Kahlua library)
+
+
+LIMITATIONS
+-----------
+- Guard bytes (_bandaged, _infectedWound, _hasSplint) cannot be toggled via
+  the editor because they change the binary layout of subsequent fields.
+  To add/remove a bandage, do it in-game.
+
+- String fields and list lengths cannot be changed — modifying their byte
+  length would shift all subsequent field offsets, corrupting the blob.
+
+- The inventory section is skipped (items are read to advance the cursor but
+  not decoded). Item editing is not supported.
+
+- HumanVisual clothing items are skipped. Appearance editing is limited to
+  the fields before the clothing array.
+
+- DeviceData and Entity sections in vehicles are not parsed (not applicable
+  to players, but noted for consistency with the vehicle extractor).
+
+- The tool operates on the raw binary blob. If the game's serialization format
+  changes (new worldVersion with layout changes), the parsers may need updating.
+  Version-gated branches already handle versions 196–249 (42.21).
+  Of 244–249, only 249 (WorldVersion_ThermalDuration) touches the player
+  blob: Thermoregulator gained a thermalDuration float after damageCounter.
+  Verified 2026-10-14 against the 42.21 decompile: all five players of a
+  live 249 save parse to the exact last byte, and a revive on a copy
+  round-trips clean (only the dead player's bytes change).
+  To check a new version: grep the decompile's IsoWorld.java for the new
+  WorldVersion_* constants, grep their uses (and literal "worldVersion >=
+  N") under zombie/characters, and run `verify` on every player of a copy
+  of players.db -- "Parsed N of N bytes" for all of them is the signal.
